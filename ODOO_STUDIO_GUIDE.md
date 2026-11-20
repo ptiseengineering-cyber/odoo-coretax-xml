@@ -117,7 +117,43 @@ Untuk menambahkan tombol **`Convert to XML`** di dashboard list view seperti pad
 
 ---
 
-## 4. Alur Kerja Pengguna Akhir (User Experience)
+## 5. Konfigurasi Sales Quotations / Sales Orders (`sale.order`)
+
+Backend yang sama juga mendukung ekspor XML langsung dari **Sales > Quotations / Orders** menggunakan endpoint `/api/quotations/bulk/xml` (dan `/api/quotations/<id>/xml`).
+
+1. Buka menu **Sales > Orders > Quotations** (Form View atau List View).
+2. Aktifkan **Odoo Studio**, lalu buat Server Action baru:
+   - **Action Name**: `Convert Quotation to XML`
+   - **Model**: `Sales Order` (`sale.order`)
+   - **Action To Do**: `Execute Code (Python Code)`
+   - **Python Code** (tersedia juga di file `action_quotation.py`):
+
+```python
+# Server Action di Odoo 19: Convert to XML (Sales Quotations / Orders)
+# Model: sale.order / Sales Order
+BASE_BACKEND_URL = "https://odoo-coretax-xml.vercel.app"
+API_SECRET = "secret_coretax_hanifa_2026"
+
+if records:
+    ids_str = ",".join(str(r.id) for r in records)
+else:
+    ids_str = str(record.id)
+
+download_url = f"{BASE_BACKEND_URL}/api/quotations/bulk/xml?ids={ids_str}&token={API_SECRET}"
+
+action = {
+    'type': 'ir.actions.act_url',
+    'url': download_url,
+    'target': 'self',
+}
+```
+
+3. Klik **`Create Contextual Action`** (atau hubungkan ke tombol di Form/List View Sales Quotations).
+4. Saat mengekspor 1 quotation (misal `S00028`), nama file yang terunduh adalah `S00028.xml`; saat memilih beberapa quotation sekaligus, nama filenya adalah `TaxInvoiceBulk_N_Quotations_YYYY-MM-DD.xml`.
+
+---
+
+## 6. Alur Kerja Pengguna Akhir (User Experience)
 
 1. Staf Accounting membuka Customer Invoice di Odoo 19 Online.
 2. Memeriksa apakah data NPWP Customer sudah terisi di tab *Other Info* / profil partner.
@@ -130,7 +166,7 @@ Untuk menambahkan tombol **`Convert to XML`** di dashboard list view seperti pad
 
 ---
 
-## 5. Troubleshooting Masalah Umum
+## 7. Troubleshooting Masalah Umum
 
 | Gejala Masalah | Penyebab | Solusi |
 | :--- | :--- | :--- |

@@ -2,8 +2,9 @@ import { appConfig } from '../../config/app.config.js';
 import { verifyInvoiceToken } from '../../utils/security.utils.js';
 
 /**
- * Controller untuk menangani HTTP request ekspor invoice XML
- * Mendukung single invoice maupun multiple invoices (bulk).
+ * Controller untuk menangani HTTP request ekspor XML Coretax
+ * Mendukung Accounting Invoice (account.move) maupun Sales Quotation/Order (sale.order),
+ * baik single maupun multiple (bulk).
  */
 export class InvoiceExportController {
   /**
@@ -13,18 +14,45 @@ export class InvoiceExportController {
     this.service = service;
   }
 
-  /**
-   * Handler untuk GET & POST /api/invoices/bulk/xml
-   */
-  exportBulkXml = async (req, res) => {
+  _buildExportOptions(query = {}, sourceType = 'account_move') {
+    const { opt, strategy, vatRate } = query;
+    return {
+      sourceType,
+      defaultOpt: opt ? opt.toUpperCase() : 'A',
+      taxStrategy: strategy || appConfig.taxCalculationStrategy,
+      vatRate: vatRate ? Number(vatRate) : appConfig.defaultVatRate
+    };
+  }
+
+  _resolveErrorStatusCode(err) {
+    if (err.code === 'VALIDATION_FAILED' || err.code === 'BULK_VALIDATION_FAILED') {
+      return 422;
+    }
+    if (err.code === 'INVOICE_NOT_FOUND' || err.code === 'ORDER_NOT_FOUND') {
+      return 404;
+    }
+    if (err.code === 'INVALID_INVOICE_ID' || err.code === 'INVALID_ORDER_ID') {
+      return 400;
+    }
+    return 500;
+  }
+
+  _sendXmlDownload(res, result) {
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    return res.status(200).send(result.xml);
+  }
+
+  async _handleBulkExport(req, res, sourceType) {
     try {
-      const idsParam = req.query.ids || req.body?.ids || req.params?.invoiceId;
-      const { token, opt, strategy, vatRate } = req.query;
+      const idsParam = req.query.ids || req.body?.ids || req.params?.invoiceId || req.params?.orderId;
+      const { token } = req.query;
 
       if (!idsParam) {
         return res.status(400).json({
           success: false,
-          error: 'MISSING_INVOICE_IDS',
+          error: sourceType === 'sale_order' ? 'MISSING_ORDER_IDS' : 'MISSING_INVOICE_IDS',
           message: 'Parameter "ids" wajib disertakan (contoh: ?ids=18,19,20,21).'
         });
       }
@@ -40,55 +68,36 @@ export class InvoiceExportController {
         }
       }
 
-      // Opsi ekspor
-      const options = {
-        defaultOpt: opt ? opt.toUpperCase() : 'A',
-        taxStrategy: strategy || appConfig.taxCalculationStrategy,
-        vatRate: vatRate ? Number(vatRate) : appConfig.defaultVatRate
-      };
-
+      const options = this._buildExportOptions(req.query, sourceType);
       const result = await this.service.exportBulkInvoicesToXml(idsParam, options);
 
-      // Set Response Headers untuk Direct Download
-      res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-
-      return res.status(200).send(result.xml);
+      return this._sendXmlDownload(res, result);
     } catch (err) {
-      const statusCode = (err.code === 'VALIDATION_FAILED' || err.code === 'BULK_VALIDATION_FAILED') ? 422 : 
-                         err.code === 'INVOICE_NOT_FOUND' ? 404 : 500;
-
-      return res.status(statusCode).json({
+      return res.status(this._resolveErrorStatusCode(err)).json({
         success: false,
         error: err.code || 'EXPORT_ERROR',
         message: err.message,
         details: err.details || undefined
       });
     }
-  };
+  }
 
-  /**
-   * Handler untuk GET /api/invoices/:invoiceId/xml
-   */
-  exportXml = async (req, res) => {
+  async _handleSingleExport(req, res, rawId, sourceType) {
     try {
-      const { invoiceId } = req.params;
-
-      // Jika invoiceId berupa "bulk" atau berisi koma (misal "18,19,20"), delegasikan ke exportBulkXml
-      if (invoiceId === 'bulk' || invoiceId.includes(',')) {
-        return this.exportBulkXml(req, res);
+      // Jika ID berupa "bulk" atau berisi koma (misal "18,19,20"), delegasikan ke bulk handler
+      if (rawId === 'bulk' || String(rawId).includes(',')) {
+        return this._handleBulkExport(req, res, sourceType);
       }
 
-      const { token, opt, strategy, vatRate } = req.query;
+      const { token } = req.query;
 
-      // 1. Validasi Invoice ID
-      const numId = Number(invoiceId);
+      // 1. Validasi ID dokumen
+      const numId = Number(rawId);
       if (!numId || isNaN(numId)) {
         return res.status(400).json({
           success: false,
-          error: 'INVALID_INVOICE_ID',
-          message: 'Parameter invoice ID harus berupa angka yang valid.'
+          error: sourceType === 'sale_order' ? 'INVALID_ORDER_ID' : 'INVALID_INVOICE_ID',
+          message: 'Parameter ID dokumen harus berupa angka yang valid.'
         });
       }
 
@@ -103,44 +112,25 @@ export class InvoiceExportController {
         }
       }
 
-      // 3. Opsi ekspor
-      const options = {
-        defaultOpt: opt ? opt.toUpperCase() : 'A',
-        taxStrategy: strategy || appConfig.taxCalculationStrategy,
-        vatRate: vatRate ? Number(vatRate) : appConfig.defaultVatRate
-      };
-
-      // 4. Eksekusi service ekspor
+      // 3. Eksekusi service ekspor
+      const options = this._buildExportOptions(req.query, sourceType);
       const result = await this.service.exportInvoiceToXml(numId, options);
 
-      // 5. Set Response Headers untuk Direct Download
-      res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-
-      // 6. Kirim file XML ke browser
-      return res.status(200).send(result.xml);
-
+      // 4. Kirim file XML ke browser
+      return this._sendXmlDownload(res, result);
     } catch (err) {
-      const statusCode = err.code === 'VALIDATION_FAILED' ? 422 : 
-                         err.code === 'INVOICE_NOT_FOUND' ? 404 : 500;
-
-      return res.status(statusCode).json({
+      return res.status(this._resolveErrorStatusCode(err)).json({
         success: false,
         error: err.code || 'EXPORT_ERROR',
         message: err.message,
         details: err.details || undefined
       });
     }
-  };
+  }
 
-  /**
-   * Handler untuk generate token download aman (digunakan oleh Odoo Server Action)
-   */
-  generateDownloadUrl = async (req, res) => {
+  async _handleGenerateDownloadUrl(req, res, rawId, routeSegment) {
     try {
-      const { invoiceId } = req.params;
-      const numId = Number(invoiceId);
+      const numId = Number(rawId);
       if (!numId || isNaN(numId)) {
         return res.status(400).json({ success: false, message: 'Invalid ID' });
       }
@@ -149,16 +139,64 @@ export class InvoiceExportController {
       const token = generateInvoiceToken(numId, appConfig.securitySecret);
       const host = req.get('host');
       const protocol = req.protocol;
-      const downloadUrl = `${protocol}://${host}/api/invoices/${numId}/xml?token=${token}`;
+      const downloadUrl = `${protocol}://${host}/api/${routeSegment}/${numId}/xml?token=${token}`;
 
-      return res.json({
+      const payload = {
         success: true,
-        invoiceId: numId,
         downloadUrl,
         token
-      });
+      };
+      if (routeSegment === 'quotations') {
+        payload.orderId = numId;
+      } else {
+        payload.invoiceId = numId;
+      }
+
+      return res.json(payload);
     } catch (err) {
       return res.status(500).json({ success: false, message: err.message });
     }
+  }
+
+  /**
+   * Handler untuk GET & POST /api/invoices/bulk/xml
+   */
+  exportBulkXml = async (req, res) => {
+    return this._handleBulkExport(req, res, 'account_move');
+  };
+
+  /**
+   * Handler untuk GET /api/invoices/:invoiceId/xml
+   */
+  exportXml = async (req, res) => {
+    return this._handleSingleExport(req, res, req.params.invoiceId, 'account_move');
+  };
+
+  /**
+   * Handler untuk generate token download aman invoice
+   */
+  generateDownloadUrl = async (req, res) => {
+    return this._handleGenerateDownloadUrl(req, res, req.params.invoiceId, 'invoices');
+  };
+
+  /**
+   * Handler untuk GET & POST /api/quotations/bulk/xml
+   */
+  exportBulkQuotationXml = async (req, res) => {
+    return this._handleBulkExport(req, res, 'sale_order');
+  };
+
+  /**
+   * Handler untuk GET /api/quotations/:orderId/xml
+   */
+  exportQuotationXml = async (req, res) => {
+    return this._handleSingleExport(req, res, req.params.orderId, 'sale_order');
+  };
+
+  /**
+   * Handler untuk generate token download aman sales quotation/order
+   */
+  generateQuotationDownloadUrl = async (req, res) => {
+    return this._handleGenerateDownloadUrl(req, res, req.params.orderId, 'quotations');
   };
 }

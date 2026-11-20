@@ -19,25 +19,70 @@ export class InvoiceExportService {
   }
 
   /**
-   * Mengambil, memvalidasi, menghitung pajak, dan mapping satu invoice ke format Coretax
+   * Menentukan apakah opsi ekspor menargetkan Sales Quotation / Sales Order (sale.order)
+   * @param {object} options
+   * @returns {boolean}
+   */
+  _isSaleOrderSource(options = {}) {
+    return options.sourceType === 'sale_order' || options.sourceType === 'sale.order';
+  }
+
+  /**
+   * Mengambil, memvalidasi, menghitung pajak, dan mapping satu dokumen (Invoice / Sales Quotation) ke format Coretax
    * @param {number|string} invoiceId
    * @param {object} options
    * @returns {Promise<{ coretaxData: object, invoice: object, summary: object }>}
    */
   async _prepareSingleInvoice(invoiceId, options = {}) {
+    const isSaleOrder = this._isSaleOrderSource(options);
     const numId = Number(invoiceId);
     if (!numId || isNaN(numId)) {
-      throw new Error(`INVALID_INVOICE_ID: ID invoice ${invoiceId} tidak valid.`);
+      const err = new Error(
+        isSaleOrder
+          ? `INVALID_ORDER_ID: ID sales quotation/order ${invoiceId} tidak valid.`
+          : `INVALID_INVOICE_ID: ID invoice ${invoiceId} tidak valid.`
+      );
+      err.code = isSaleOrder ? 'INVALID_ORDER_ID' : 'INVALID_INVOICE_ID';
+      throw err;
     }
 
-    // 1. Ambil data invoice header
-    const invoice = await this.odooRepository.getInvoiceById(numId);
-    if (!invoice) {
-      throw new Error(`INVOICE_NOT_FOUND: Invoice dengan ID ${numId} tidak ditemukan di Odoo.`);
-    }
+    // 1. Ambil data dokumen header & lines sesuai tipe sumber
+    let invoice;
+    let lines;
 
-    // 2. Ambil data lines produk
-    const lines = await this.odooRepository.getInvoiceLines(invoice.invoice_line_ids || []);
+    if (isSaleOrder) {
+      const rawOrder = await this.odooRepository.getSaleOrderById(numId);
+      if (!rawOrder) {
+        const err = new Error(`ORDER_NOT_FOUND: Sales Quotation/Order dengan ID ${numId} tidak ditemukan di Odoo.`);
+        err.code = 'ORDER_NOT_FOUND';
+        throw err;
+      }
+
+      invoice = {
+        ...rawOrder,
+        source_model: rawOrder.source_model || 'sale.order',
+        invoice_date: rawOrder.invoice_date || (rawOrder.date_order ? String(rawOrder.date_order).slice(0, 10) : null),
+        ref: rawOrder.ref !== undefined ? rawOrder.ref : (rawOrder.client_order_ref || rawOrder.origin || ''),
+        invoice_line_ids: rawOrder.invoice_line_ids || rawOrder.order_line || []
+      };
+
+      const rawLines = await this.odooRepository.getSaleOrderLines(invoice.invoice_line_ids || []);
+      lines = (rawLines || []).map((line) => ({
+        ...line,
+        quantity: line.quantity !== undefined ? line.quantity : line.product_uom_qty,
+        product_uom_id: line.product_uom_id || line.product_uom || null,
+        tax_ids: line.tax_ids || line.tax_id || []
+      }));
+    } else {
+      invoice = await this.odooRepository.getInvoiceById(numId);
+      if (!invoice) {
+        const err = new Error(`INVOICE_NOT_FOUND: Invoice dengan ID ${numId} tidak ditemukan di Odoo.`);
+        err.code = 'INVOICE_NOT_FOUND';
+        throw err;
+      }
+
+      lines = await this.odooRepository.getInvoiceLines(invoice.invoice_line_ids || []);
+    }
 
     // 3. Ambil data partner
     const partnerId = Array.isArray(invoice.partner_id) ? invoice.partner_id[0] : invoice.partner_id;
@@ -50,7 +95,10 @@ export class InvoiceExportService {
     // 5. Validasi data sebelum perhitungan
     const validation = InvoiceExportValidator.validateRawData(
       { invoice, company, partner, lines },
-      { expectedCompanyName: options.expectedCompanyName }
+      {
+        expectedCompanyName: options.expectedCompanyName,
+        sourceType: isSaleOrder ? 'sale_order' : 'account_move'
+      }
     );
 
     if (!validation.isValid) {
@@ -58,7 +106,7 @@ export class InvoiceExportService {
       err.code = 'VALIDATION_FAILED';
       err.details = validation.errors;
       err.invoiceId = numId;
-      err.invoiceName = invoice.name || `INV-${numId}`;
+      err.invoiceName = invoice.name || `${isSaleOrder ? 'SO' : 'INV'}-${numId}`;
       throw err;
     }
 
@@ -88,15 +136,16 @@ export class InvoiceExportService {
   }
 
   /**
-   * Memproses ekspor satu invoice ke format XML Coretax
+   * Memproses ekspor satu dokumen (Invoice / Sales Quotation) ke format XML Coretax
    * @param {number|string} invoiceId
    * @param {object} options
    * @returns {Promise<{ xml: string, filename: string, invoice: object, summary: object }>}
    */
   async exportInvoiceToXml(invoiceId, options = {}) {
+    const isSaleOrder = this._isSaleOrderSource(options);
     const prepared = await this._prepareSingleInvoice(invoiceId, options);
 
-    // Generate XML untuk single invoice
+    // Generate XML untuk single dokumen
     const xmlContent = CoretaxXmlGenerator.generate(prepared.coretaxData);
 
     // Validasi hasil XML
@@ -109,7 +158,8 @@ export class InvoiceExportService {
     }
 
     // Format nama file download
-    const safeInvoiceName = (prepared.invoice.name || `INV-${prepared.invoice.id}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const fallbackPrefix = isSaleOrder ? 'SO' : 'INV';
+    const safeInvoiceName = (prepared.invoice.name || `${fallbackPrefix}-${prepared.invoice.id}`).replace(/[^a-zA-Z0-9_-]/g, '_');
     const filename = `${safeInvoiceName}.xml`;
 
     return {
@@ -121,12 +171,23 @@ export class InvoiceExportService {
   }
 
   /**
-   * Memproses ekspor multiple invoices sekaligus ke dalam 1 file XML Coretax (TaxInvoiceBulk)
+   * Memproses ekspor satu Sales Quotation / Order ke format XML Coretax
+   * @param {number|string} orderId
+   * @param {object} options
+   * @returns {Promise<{ xml: string, filename: string, invoice: object, summary: object }>}
+   */
+  async exportQuotationToXml(orderId, options = {}) {
+    return this.exportInvoiceToXml(orderId, { ...options, sourceType: 'sale_order' });
+  }
+
+  /**
+   * Memproses ekspor multiple dokumen sekaligus ke dalam 1 file XML Coretax (TaxInvoiceBulk)
    * @param {Array<number|string>|string} invoiceIds - Array of IDs atau string dipisahkan koma "1,2,3"
    * @param {object} options
    * @returns {Promise<{ xml: string, filename: string, invoices: Array<object>, count: number }>}
    */
   async exportBulkInvoicesToXml(invoiceIds, options = {}) {
+    const isSaleOrder = this._isSaleOrderSource(options);
     let ids = [];
     if (typeof invoiceIds === 'string') {
       ids = invoiceIds.split(',').map(s => s.trim()).filter(Boolean);
@@ -135,10 +196,14 @@ export class InvoiceExportService {
     }
 
     if (ids.length === 0) {
-      throw new Error('NO_INVOICES_SELECTED: Minimal satu ID invoice harus dipilih untuk diekspor.');
+      throw new Error(
+        isSaleOrder
+          ? 'NO_ORDERS_SELECTED: Minimal satu ID sales quotation/order harus dipilih untuk diekspor.'
+          : 'NO_INVOICES_SELECTED: Minimal satu ID invoice harus dipilih untuk diekspor.'
+      );
     }
 
-    // Jika hanya 1 invoice, gunakan nama invoice untuk filename yang lebih spesifik
+    // Jika hanya 1 dokumen, gunakan nama dokumen untuk filename yang lebih spesifik
     if (ids.length === 1) {
       const single = await this.exportInvoiceToXml(ids[0], options);
       return {
@@ -157,14 +222,15 @@ export class InvoiceExportService {
         const item = await this._prepareSingleInvoice(id, options);
         preparedInvoices.push(item);
       } catch (err) {
-        const invLabel = err.invoiceName || `Invoice ID ${id}`;
-        errors.push(`[${invLabel}]: ${err.message}`);
+        const docLabel = err.invoiceName || `${isSaleOrder ? 'Quotation' : 'Invoice'} ID ${id}`;
+        errors.push(`[${docLabel}]: ${err.message}`);
       }
     }
 
-    // Jika ada error pada invoice yang dipilih, laporkan secara informatif
+    // Jika ada error pada dokumen yang dipilih, laporkan secara informatif
     if (errors.length > 0) {
-      const err = new Error(`Beberapa invoice tidak valid:\n${errors.join('\n')}`);
+      const prefix = isSaleOrder ? 'Beberapa sales quotation tidak valid' : 'Beberapa invoice tidak valid';
+      const err = new Error(`${prefix}:\n${errors.join('\n')}`);
       err.code = 'BULK_VALIDATION_FAILED';
       err.details = errors;
       throw err;
@@ -185,9 +251,10 @@ export class InvoiceExportService {
       throw err;
     }
 
-    // Format nama file: TaxInvoiceBulk_4_Invoices_YYYY-MM-DD.xml
+    // Format nama file: TaxInvoiceBulk_4_Invoices_YYYY-MM-DD.xml atau TaxInvoiceBulk_4_Quotations_YYYY-MM-DD.xml
     const dateStr = new Date().toISOString().slice(0, 10);
-    const filename = `TaxInvoiceBulk_${preparedInvoices.length}_Invoices_${dateStr}.xml`;
+    const label = isSaleOrder ? 'Quotations' : 'Invoices';
+    const filename = `TaxInvoiceBulk_${preparedInvoices.length}_${label}_${dateStr}.xml`;
 
     return {
       xml: xmlContent,
@@ -195,5 +262,15 @@ export class InvoiceExportService {
       invoices: preparedInvoices.map(p => p.invoice),
       count: preparedInvoices.length
     };
+  }
+
+  /**
+   * Memproses ekspor multiple Sales Quotations / Orders sekaligus ke dalam 1 file XML Coretax
+   * @param {Array<number|string>|string} orderIds
+   * @param {object} options
+   * @returns {Promise<{ xml: string, filename: string, invoices: Array<object>, count: number }>}
+   */
+  async exportBulkQuotationsToXml(orderIds, options = {}) {
+    return this.exportBulkInvoicesToXml(orderIds, { ...options, sourceType: 'sale_order' });
   }
 }

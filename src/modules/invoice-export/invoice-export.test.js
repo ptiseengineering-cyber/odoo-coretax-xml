@@ -7,6 +7,7 @@ import { generateInvoiceToken, verifyInvoiceToken } from '../../utils/security.u
 import { escapeXml, formatXmlDate } from '../../utils/xml.utils.js';
 import { CoretaxXmlGenerator } from '../../xml/coretax.generator.js';
 import { CoretaxXmlValidator } from '../../xml/coretax.validator.js';
+import { OdooRepository } from '../../integrations/odoo/odoo.repository.js';
 import { InvoiceExportService } from './invoice-export.service.js';
 import { InvoiceExportValidator } from './invoice-export.validator.js';
 
@@ -15,6 +16,8 @@ class MockOdooRepository {
   constructor(customData = {}) {
     this.invoices = customData.invoices || {};
     this.lines = customData.lines || {};
+    this.saleOrders = customData.saleOrders || {};
+    this.saleOrderLines = customData.saleOrderLines || {};
     this.partners = customData.partners || {};
     this.companies = customData.companies || {};
   }
@@ -25,6 +28,30 @@ class MockOdooRepository {
 
   async getInvoiceLines(lineIds) {
     return lineIds.map(id => this.lines[id]).filter(Boolean);
+  }
+
+  async getSaleOrderById(id) {
+    const order = this.saleOrders[id];
+    if (!order) return null;
+    return {
+      ...order,
+      source_model: 'sale.order',
+      invoice_date: order.date_order ? String(order.date_order).slice(0, 10) : null,
+      ref: order.client_order_ref || order.origin || '',
+      invoice_line_ids: order.order_line || []
+    };
+  }
+
+  async getSaleOrderLines(lineIds) {
+    return lineIds
+      .map(id => this.saleOrderLines[id])
+      .filter(Boolean)
+      .filter(line => !line.display_type || line.display_type === 'product')
+      .map(line => ({
+        ...line,
+        quantity: line.product_uom_qty,
+        product_uom_id: line.product_uom_id || line.product_uom || null
+      }));
   }
 
   async getPartnerById(id) {
@@ -222,7 +249,7 @@ describe('4. 17 Skenario Uji Persyaratan Sistem (End-to-End Service Tests)', () 
     assert.ok(res.xml);
     assert.strictEqual(res.filename, 'INV_2026_0001.xml');
     assert.strictEqual(res.xml.match(/<GoodService>/g).length, 1);
-    assert.ok(res.xml.includes('<Unit>Pcs</Unit>'));
+    assert.ok(res.xml.includes('<Unit>UM.0018</Unit>'));
   });
 
   it('Test Case 2: Invoice beberapa baris produk (3 baris)', async () => {
@@ -364,10 +391,10 @@ describe('4. 17 Skenario Uji Persyaratan Sistem (End-to-End Service Tests)', () 
     }
   });
 
-  it('Test Case 18: Fallback Unit ke UM.0001 apabila unit di Odoo kosong', async () => {
+  it('Test Case 18: Unit di XML Coretax menggunakan kode baku UM.0018', async () => {
     // Invoice 10 memiliki line 104 tanpa product_uom_id
     const res = await service.exportInvoiceToXml(10);
-    assert.ok(res.xml.includes('<Unit>UM.0001</Unit>'));
+    assert.ok(res.xml.includes('<Unit>UM.0018</Unit>'));
   });
 
   it('Test Case 19: Ekspor Multiple Invoices (Bulk Export) ke 1 file TaxInvoiceBulk XML', async () => {
@@ -415,5 +442,200 @@ describe('4. 17 Skenario Uji Persyaratan Sistem (End-to-End Service Tests)', () 
     assert.strictEqual(statusResult, 200);
     assert.ok(headersResult['Content-Disposition'].includes('TaxInvoiceBulk_3_Invoices_'));
     assert.strictEqual(sentBody.match(/<TaxInvoice>/g).length, 3);
+  });
+});
+
+describe('5. Sales Quotations / Orders (sale.order) Support', () => {
+  const quotationMockRepo = new MockOdooRepository({
+    companies: { 1: defaultCompany },
+    partners: { 10: defaultPartner },
+    saleOrderLines: {
+      201: { id: 201, name: 'Mesin Perajang', product_uom_qty: 1, price_unit: 5000000, discount: 0, product_uom_id: [1, 'Units'] },
+      202: { id: 202, name: 'Uang Muka', display_type: 'line_section', product_uom_qty: 0, price_unit: 0 },
+      203: { id: 203, name: 'Uang Muka (Dibatalkan)', is_downpayment: true, product_uom_qty: 0, price_unit: 0 },
+      204: { id: 204, name: 'Bangku kayu jati', product_uom_qty: 1, price_unit: 1200000, discount: 0, product_uom_id: [1, 'Units'] },
+      205: { id: 205, name: 'CPX_Installation Chemical Pipe to CIP RTD', product_uom_qty: 1, price_unit: 846481000, discount: 0, product_uom_id: [1, 'units'] }
+    },
+    saleOrders: {
+      28: {
+        id: 28,
+        name: 'S00028',
+        state: 'draft',
+        date_order: '2026-10-27 08:41:00',
+        client_order_ref: 'PO-2026-028',
+        partner_id: [10, defaultPartner.name],
+        company_id: [1, defaultCompany.name],
+        order_line: [201, 202, 203]
+      },
+      29: {
+        id: 29,
+        name: 'S00029',
+        state: 'sale',
+        date_order: '2026-11-20 09:55:00',
+        client_order_ref: 'PO-2026-029',
+        partner_id: [10, defaultPartner.name],
+        company_id: [1, defaultCompany.name],
+        order_line: [204, 205]
+      },
+      30: {
+        id: 30,
+        name: 'S00030',
+        state: 'cancel',
+        date_order: '2026-10-29 10:00:00',
+        partner_id: [10, defaultPartner.name],
+        company_id: [1, defaultCompany.name],
+        order_line: [201]
+      },
+      31: {
+        id: 31,
+        name: 'S00031',
+        state: 'sent',
+        date_order: '2026-11-21 10:00:00',
+        origin: 'CRM-31',
+        partner_id: [10, defaultPartner.name],
+        company_id: [1, defaultCompany.name],
+        order_line: [201, 202]
+      }
+    }
+  });
+
+  const quotationService = new InvoiceExportService(quotationMockRepo);
+
+  it('Ekspor single Sales Quotation/Order (S00029) mengabaikan section line dan menghasilkan XML valid', async () => {
+    const res = await quotationService.exportQuotationToXml(31);
+    assert.strictEqual(res.filename, 'S00031.xml');
+    assert.ok(res.xml.includes('<TaxInvoiceDate>2026-11-21</TaxInvoiceDate>'));
+    assert.ok(res.xml.includes('<RefDesc>CRM-31</RefDesc>'));
+    assert.ok(res.xml.includes('<Name>Mesin Perajang</Name>'));
+    assert.ok(res.xml.includes('<Price>5000000</Price>'));
+    assert.strictEqual(res.xml.match(/<GoodService>/g).length, 1);
+
+    const res29 = await quotationService.exportQuotationToXml(29);
+    assert.strictEqual(res29.filename, 'S00029.xml');
+    assert.strictEqual(res29.xml.match(/<GoodService>/g).length, 2);
+
+    const validation = CoretaxXmlValidator.validate(res29.xml);
+    assert.strictEqual(validation.isValid, true);
+  });
+
+  it('Menggagalkan Sales Quotation jika terdapat baris produk Quantity = 0.00 dan Unit Price = 0.00', async () => {
+    await assert.rejects(
+      async () => quotationService.exportQuotationToXml(28),
+      err => {
+        assert.ok(err.message.includes('INVALID_LINE_QTY'));
+        return true;
+      }
+    );
+  });
+
+  it('Menolak Sales Quotation berstatus cancel dengan INVALID_ORDER_STATE', async () => {
+    await assert.rejects(
+      async () => quotationService.exportQuotationToXml(30),
+      err => {
+        assert.ok(err.message.includes('INVALID_ORDER_STATE'));
+        return true;
+      }
+    );
+  });
+
+  it('Ekspor bulk multiple Sales Quotations menghasilkan TaxInvoiceBulk_2_Quotations XML', async () => {
+    const resBulk = await quotationService.exportBulkQuotationsToXml('29,31');
+    assert.strictEqual(resBulk.count, 2);
+    assert.ok(resBulk.filename.startsWith('TaxInvoiceBulk_2_Quotations_'));
+    assert.strictEqual(resBulk.xml.match(/<TaxInvoice>/g).length, 2);
+
+    const validation = CoretaxXmlValidator.validate(resBulk.xml);
+    assert.strictEqual(validation.isValid, true);
+  });
+
+  it('Controller endpoint quotations single, bulk, dan 404 ORDER_NOT_FOUND berfungsi benar', async () => {
+    const { InvoiceExportController } = await import('./invoice-export.controller.js');
+    const controller = new InvoiceExportController(quotationService);
+
+    let statusResult = 0;
+    let headersResult = {};
+    let sentBody = '';
+    let jsonResult = null;
+
+    const createMockRes = () => ({
+      status: (s) => { statusResult = s; return createMockRes(); },
+      setHeader: (k, v) => { headersResult[k] = v; },
+      send: (b) => { sentBody = b; },
+      json: (j) => { jsonResult = j; }
+    });
+
+    await controller.exportQuotationXml(
+      { params: { orderId: '29' }, query: { token: appConfig.securitySecret } },
+      createMockRes()
+    );
+    assert.strictEqual(statusResult, 200);
+    assert.ok(headersResult['Content-Disposition'].includes('S00029.xml'));
+    assert.ok(sentBody.includes('<TaxInvoiceBulk'));
+
+    headersResult = {};
+    sentBody = '';
+    await controller.exportBulkQuotationXml(
+      { query: { ids: '29,31', token: appConfig.securitySecret } },
+      createMockRes()
+    );
+    assert.strictEqual(statusResult, 200);
+    assert.ok(headersResult['Content-Disposition'].includes('TaxInvoiceBulk_2_Quotations_'));
+    assert.strictEqual(sentBody.match(/<TaxInvoice>/g).length, 2);
+
+    await controller.exportQuotationXml(
+      { params: { orderId: '9999' }, query: { token: appConfig.securitySecret } },
+      createMockRes()
+    );
+    assert.strictEqual(statusResult, 404);
+    assert.strictEqual(jsonResult.error, 'ORDER_NOT_FOUND');
+  });
+
+  it('OdooRepository menormalisasi sale.order dan memfilter section/note pada sale.order.line tanpa menyembunyikan baris qty 0', async () => {
+    const mockClient = {
+      async executeKw(model, method) {
+        if (method === 'fields_get') {
+          if (model === 'sale.order') {
+            return { id: {}, name: {}, state: {}, date_order: {}, client_order_ref: {}, partner_id: {}, company_id: {}, order_line: {} };
+          }
+          if (model === 'sale.order.line') {
+            return { id: {}, name: {}, product_uom_qty: {}, price_unit: {}, discount: {}, tax_ids: {}, product_uom_id: {}, display_type: {} };
+          }
+        }
+        if (model === 'sale.order' && method === 'read') {
+          return [{
+            id: 28,
+            name: 'S00028',
+            state: 'draft',
+            date_order: '2026-10-27 08:41:00',
+            client_order_ref: 'REF-28',
+            partner_id: [10, 'Customer'],
+            company_id: [1, 'Company'],
+            order_line: [1, 2, 3]
+          }];
+        }
+        if (model === 'sale.order.line' && method === 'read') {
+          return [
+            { id: 1, name: 'Mesin Perajang', product_uom_qty: 1, price_unit: 5000000, discount: 0, product_uom_id: [1, 'Units'], display_type: false },
+            { id: 2, name: 'Uang Muka', product_uom_qty: 0, price_unit: 0, display_type: 'line_section' },
+            { id: 3, name: 'Uang Muka (Dibatalkan)', product_uom_qty: 0, price_unit: 0, display_type: false }
+          ];
+        }
+        return [];
+      }
+    };
+
+    const repo = new OdooRepository(mockClient);
+    const order = await repo.getSaleOrderById(28);
+    assert.strictEqual(order.source_model, 'sale.order');
+    assert.strictEqual(order.invoice_date, '2026-10-27');
+    assert.strictEqual(order.ref, 'REF-28');
+    assert.deepStrictEqual(order.invoice_line_ids, [1, 2, 3]);
+
+    const lines = await repo.getSaleOrderLines([1, 2, 3]);
+    assert.strictEqual(lines.length, 2);
+    assert.strictEqual(lines[0].name, 'Mesin Perajang');
+    assert.strictEqual(lines[0].quantity, 1);
+    assert.strictEqual(lines[1].name, 'Uang Muka (Dibatalkan)');
+    assert.strictEqual(lines[1].quantity, 0);
   });
 });
